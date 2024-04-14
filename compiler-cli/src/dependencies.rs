@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io,
     time::Instant,
 };
 
@@ -12,6 +13,7 @@ use gleam_core::{
     config::PackageConfig,
     dependency,
     error::{FileIoAction, FileKind, StandardIoAction},
+    git,
     hex::{self, HEXPM_PUBLIC_KEY},
     io::{HttpClient as _, TarUnpacker, WrappedReader},
     manifest::{Base16Checksum, Manifest, ManifestPackage, ManifestPackageSource},
@@ -206,24 +208,41 @@ async fn add_missing_packages<Telem: Telemetry>(
     let missing_packages = local.missing_local_packages(manifest, &project_name);
 
     let mut num_to_download = 0;
-    let mut missing_hex_packages = missing_packages
+    let (mut missing_hex_packages, mut missing_git_packages) = missing_packages
         .into_iter()
-        .filter(|package| package.is_hex())
+        .filter(|package| package.is_hex() || package.is_git())
         .map(|package| {
             num_to_download += 1;
             package
         })
-        .peekable();
+        .partition(|package| package.is_hex());
+
+    let mut missing_hex_packages = missing_hex_packages.peekable();
+    let mut missing_git_packages = missing_git_packages.peekable();
+    let hex_packages_are_missing = missing_hex_packages.peek().is_some();
+    let git_packages_are_missing = missing_git_packages.peek().is_some();
 
     // If we need to download at-least one package
-    if missing_hex_packages.peek().is_some() {
-        let http = HttpClient::boxed();
-        let downloader = hex::Downloader::new(fs.clone(), fs, http, Untar::boxed(), paths.clone());
+    if hex_packages_are_missing || git_packages_are_missing {
         let start = Instant::now();
         telemetry.downloading_package("packages");
-        downloader
-            .download_hex_packages(missing_hex_packages, &project_name)
-            .await?;
+
+        if hex_packages_are_missing {
+            let http = HttpClient::boxed();
+            let downloader =
+                hex::Downloader::new(fs.clone(), fs.clone(), http, Untar::boxed(), paths.clone());
+            downloader
+                .download_hex_packages(missing_hex_packages, &project_name)
+                .await?;
+        }
+
+        if git_packages_are_missing {
+            let downloader = git::Downloader::new(fs.clone(), fs.clone(), paths.clone());
+            downloader
+                .download_git_packages(missing_git_packages, &project_name)
+                .await?;
+        }
+
         telemetry.packages_downloaded(start, num_to_download);
     }
 
@@ -691,6 +710,10 @@ fn resolve_versions<Telem: Telemetry>(
     // The version requires of the current project
     let mut root_requirements = HashMap::new();
 
+    let fs = ProjectIO::new();
+    let git_downloader =
+        git::Downloader::new(Box::new(fs.clone()), Box::new(fs), project_paths.clone());
+
     // Populate the provided_packages and root_requirements maps
     for (name, requirement) in dependencies.into_iter() {
         let version = match requirement {
@@ -700,12 +723,18 @@ fn resolve_versions<Telem: Telemetry>(
                 &path,
                 project_paths.root(),
                 project_paths,
+                &git_downloader,
                 &mut provided_packages,
                 &mut vec![],
             )?,
-            Requirement::Git { git } => {
-                provide_git_package(name.clone(), &git, project_paths, &mut provided_packages)?
-            }
+            Requirement::Git { git } => provide_git_package(
+                name.clone(),
+                &git,
+                project_paths,
+                &git_downloader,
+                &mut provided_packages,
+                &mut vec![],
+            )?,
         };
         let _ = root_requirements.insert(name, version);
     }
@@ -745,6 +774,7 @@ fn provide_local_package(
     package_path: &Utf8Path,
     parent_path: &Utf8Path,
     project_paths: &ProjectPaths,
+    git_downloader: &git::Downloader,
     provided: &mut HashMap<EcoString, ProvidedPackage>,
     parents: &mut Vec<EcoString>,
 ) -> Result<hexpm::version::Range> {
@@ -761,6 +791,7 @@ fn provide_local_package(
         package_path,
         package_source,
         project_paths,
+        git_downloader,
         provided,
         parents,
     )
@@ -768,16 +799,52 @@ fn provide_local_package(
 
 /// Provide a package from a git repository
 fn provide_git_package(
-    _package_name: EcoString,
-    _repo: &str,
-    _project_paths: &ProjectPaths,
-    _provided: &mut HashMap<EcoString, ProvidedPackage>,
+    package_name: EcoString,
+    repo: &str,
+    project_paths: &ProjectPaths,
+    git_downloader: &git::Downloader,
+    provided: &mut HashMap<EcoString, ProvidedPackage>,
+    parents: &mut Vec<EcoString>,
 ) -> Result<hexpm::version::Range> {
-    let _git = ProvidedPackageSource::Git {
-        repo: "repo".into(),
-        commit: "commit".into(),
+    let _ = git_downloader.ensure_git_package_in_build_directory(&package_name, repo, None)?;
+    let package_path = project_paths.build_packages_package(&package_name);
+    let commit = get_checked_out_commit_of_repository(&package_path);
+    let package_source = ProvidedPackageSource::Git {
+        repo: repo.into(),
+        commit: commit.into(),
     };
-    Err(Error::GitDependencyUnsupported)
+    provide_package(
+        package_name,
+        package_path,
+        package_source,
+        project_paths,
+        git_downloader,
+        provided,
+        parents,
+    )
+}
+
+fn get_checked_out_commit_of_repository(path: &Utf8Path) -> Result<String> {
+    let result = std::process::Command::new("git")
+        .args(&["rev-parse", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .current_dir(path)
+        .output();
+
+    match result {
+        Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).to_string()),
+        Err(error) => match error.kind() {
+            io::ErrorKind::NotFound => Err(Error::ShellProgramNotFound {
+                program: "git".into(),
+            }),
+
+            other => Err(Error::ShellCommand {
+                program: "git".into(),
+                err: Some(other),
+            }),
+        },
+    }
 }
 
 /// Adds a gleam project located at a specific path to the list of "provided packages"
@@ -786,6 +853,7 @@ fn provide_package(
     package_path: Utf8PathBuf,
     package_source: ProvidedPackageSource,
     project_paths: &ProjectPaths,
+    git_downloader: &git::Downloader,
     provided: &mut HashMap<EcoString, ProvidedPackage>,
     parents: &mut Vec<EcoString>,
 ) -> Result<hexpm::version::Range> {
@@ -841,13 +909,19 @@ fn provide_package(
                     &path,
                     &package_path,
                     project_paths,
+                    git_downloader,
                     provided,
                     parents,
                 )?
             }
-            Requirement::Git { git } => {
-                provide_git_package(name.clone(), &git, project_paths, provided)?
-            }
+            Requirement::Git { git } => provide_git_package(
+                name.clone(),
+                &git,
+                project_paths,
+                git_downloader,
+                provided,
+                parents,
+            )?,
         };
         let _ = requirements.insert(name, version);
     }
