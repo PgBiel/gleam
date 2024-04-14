@@ -1,13 +1,9 @@
 use crate::io::{CommandExecutor, FileSystemReader, Stdio};
 use crate::manifest::{ManifestPackage, ManifestPackageSource};
 use crate::paths::ProjectPaths;
-use crate::{paths, Error};
-use camino::Utf8Path;
+use crate::Error;
 use debug_ignore::DebugIgnore;
-use flate2::read::GzDecoder;
 use futures::future;
-use hexpm::version::Version;
-use tar::Archive;
 
 #[derive(Debug)]
 pub struct Downloader {
@@ -69,7 +65,7 @@ impl Downloader {
         let cloned = self.ensure_package_repository_cloned(name, repo).await?;
 
         let checkout_done = match commit {
-            Some(commit) => self.checkout_package_repository_to_commit(&name, commit)?,
+            Some(commit) => self.checkout_package_repository_to_commit(name, commit)?,
             None => false,
         };
 
@@ -147,7 +143,7 @@ impl Downloader {
                     panic!("attempt to download non-git package through git")
                 };
 
-                self.ensure_package_in_build_directory(package, repo, Some(commit))
+                self.ensure_git_package_in_build_directory(&package.name, repo, Some(commit))
             });
 
         // Run the futures to download the packages concurrently

@@ -207,22 +207,30 @@ async fn add_missing_packages<Telem: Telemetry>(
 ) -> Result<(), Error> {
     let missing_packages = local.missing_local_packages(manifest, &project_name);
 
-    let mut num_to_download = 0;
-    let (mut missing_hex_packages, mut missing_git_packages) = missing_packages
-        .into_iter()
-        .filter(|package| package.is_hex() || package.is_git())
+    let mut hex_num_to_download = 0;
+    let mut missing_hex_packages = missing_packages
+        .iter()
+        .filter(|package| package.is_hex())
         .map(|package| {
-            num_to_download += 1;
-            package
+            hex_num_to_download += 1;
+            *package
         })
-        .partition(|package| package.is_hex());
+        .peekable();
 
-    let mut missing_hex_packages = missing_hex_packages.peekable();
-    let mut missing_git_packages = missing_git_packages.peekable();
+    let mut git_num_to_download = 0;
+    let mut missing_git_packages = missing_packages
+        .iter()
+        .filter(|package| package.is_git())
+        .map(|package| {
+            git_num_to_download += 1;
+            *package
+        })
+        .peekable();
+
     let hex_packages_are_missing = missing_hex_packages.peek().is_some();
     let git_packages_are_missing = missing_git_packages.peek().is_some();
 
-    // If we need to download at-least one package
+    // If we need to download at least one package
     if hex_packages_are_missing || git_packages_are_missing {
         let start = Instant::now();
         telemetry.downloading_package("packages");
@@ -243,7 +251,7 @@ async fn add_missing_packages<Telem: Telemetry>(
                 .await?;
         }
 
-        telemetry.packages_downloaded(start, num_to_download);
+        telemetry.packages_downloaded(start, hex_num_to_download + git_num_to_download);
     }
 
     Ok(())
@@ -712,7 +720,7 @@ fn resolve_versions<Telem: Telemetry>(
 
     let fs = ProjectIO::new();
     let git_downloader =
-        git::Downloader::new(Box::new(fs.clone()), Box::new(fs), project_paths.clone());
+        git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
 
     // Populate the provided_packages and root_requirements maps
     for (name, requirement) in dependencies.into_iter() {
@@ -724,6 +732,7 @@ fn resolve_versions<Telem: Telemetry>(
                 project_paths.root(),
                 project_paths,
                 &git_downloader,
+                &runtime,
                 &mut provided_packages,
                 &mut vec![],
             )?,
@@ -732,6 +741,7 @@ fn resolve_versions<Telem: Telemetry>(
                 &git,
                 project_paths,
                 &git_downloader,
+                &runtime,
                 &mut provided_packages,
                 &mut vec![],
             )?,
@@ -753,7 +763,7 @@ fn resolve_versions<Telem: Telemetry>(
         &locked,
     )?;
 
-    // Convert the hex packages and local packages into manifest packages
+    // Convert the hex, git and local packages into manifest packages
     let manifest_packages = runtime.block_on(future::try_join_all(
         resolved
             .into_iter()
@@ -769,12 +779,14 @@ fn resolve_versions<Telem: Telemetry>(
 }
 
 /// Provide a package from a local project
+#[allow(clippy::too_many_arguments)]
 fn provide_local_package(
     package_name: EcoString,
     package_path: &Utf8Path,
     parent_path: &Utf8Path,
     project_paths: &ProjectPaths,
     git_downloader: &git::Downloader,
+    runtime: &tokio::runtime::Handle,
     provided: &mut HashMap<EcoString, ProvidedPackage>,
     parents: &mut Vec<EcoString>,
 ) -> Result<hexpm::version::Range> {
@@ -792,23 +804,30 @@ fn provide_local_package(
         package_source,
         project_paths,
         git_downloader,
+        runtime,
         provided,
         parents,
     )
 }
 
 /// Provide a package from a git repository
+#[allow(clippy::too_many_arguments)]
 fn provide_git_package(
     package_name: EcoString,
     repo: &str,
     project_paths: &ProjectPaths,
     git_downloader: &git::Downloader,
+    runtime: &tokio::runtime::Handle,
     provided: &mut HashMap<EcoString, ProvidedPackage>,
     parents: &mut Vec<EcoString>,
 ) -> Result<hexpm::version::Range> {
-    let _ = git_downloader.ensure_git_package_in_build_directory(&package_name, repo, None)?;
+    let _ = runtime.block_on(git_downloader.ensure_git_package_in_build_directory(
+        &package_name,
+        repo,
+        None,
+    ))?;
     let package_path = project_paths.build_packages_package(&package_name);
-    let commit = get_checked_out_commit_of_repository(&package_path);
+    let commit = get_checked_out_commit_of_repository(&package_path)?;
     let package_source = ProvidedPackageSource::Git {
         repo: repo.into(),
         commit: commit.into(),
@@ -819,6 +838,7 @@ fn provide_git_package(
         package_source,
         project_paths,
         git_downloader,
+        runtime,
         provided,
         parents,
     )
@@ -826,7 +846,7 @@ fn provide_git_package(
 
 fn get_checked_out_commit_of_repository(path: &Utf8Path) -> Result<String> {
     let result = std::process::Command::new("git")
-        .args(&["rev-parse", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .current_dir(path)
@@ -848,12 +868,14 @@ fn get_checked_out_commit_of_repository(path: &Utf8Path) -> Result<String> {
 }
 
 /// Adds a gleam project located at a specific path to the list of "provided packages"
+#[allow(clippy::too_many_arguments)]
 fn provide_package(
     package_name: EcoString,
     package_path: Utf8PathBuf,
     package_source: ProvidedPackageSource,
     project_paths: &ProjectPaths,
     git_downloader: &git::Downloader,
+    runtime: &tokio::runtime::Handle,
     provided: &mut HashMap<EcoString, ProvidedPackage>,
     parents: &mut Vec<EcoString>,
 ) -> Result<hexpm::version::Range> {
@@ -910,6 +932,7 @@ fn provide_package(
                     &package_path,
                     project_paths,
                     git_downloader,
+                    runtime,
                     provided,
                     parents,
                 )?
@@ -919,6 +942,7 @@ fn provide_package(
                 &git,
                 project_paths,
                 git_downloader,
+                runtime,
                 provided,
                 parents,
             )?,
@@ -943,12 +967,17 @@ fn provide_package(
 #[test]
 fn provide_wrong_package() {
     let mut provided = HashMap::new();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fs = ProjectIO::new();
     let project_paths = crate::project_paths_at_current_directory_without_toml();
+    let git_downloader = git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
     let result = provide_local_package(
         "wrong_name".into(),
         Utf8Path::new("./test/hello_world"),
         Utf8Path::new("./"),
         &project_paths,
+        &git_downloader,
+        runtime.handle(),
         &mut provided,
         &mut vec!["root".into(), "subpackage".into()],
     );
@@ -966,13 +995,18 @@ fn provide_wrong_package() {
 #[test]
 fn provide_existing_package() {
     let mut provided = HashMap::new();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fs = ProjectIO::new();
     let project_paths = crate::project_paths_at_current_directory_without_toml();
+    let git_downloader = git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
 
     let result = provide_local_package(
         "hello_world".into(),
         Utf8Path::new("./test/hello_world"),
         Utf8Path::new("./"),
         &project_paths,
+        &git_downloader,
+        runtime.handle(),
         &mut provided,
         &mut vec!["root".into(), "subpackage".into()],
     );
@@ -983,6 +1017,8 @@ fn provide_existing_package() {
         Utf8Path::new("./test/hello_world"),
         Utf8Path::new("./"),
         &project_paths,
+        &git_downloader,
+        runtime.handle(),
         &mut provided,
         &mut vec!["root".into(), "subpackage".into()],
     );
@@ -992,12 +1028,17 @@ fn provide_existing_package() {
 #[test]
 fn provide_conflicting_package() {
     let mut provided = HashMap::new();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fs = ProjectIO::new();
     let project_paths = crate::project_paths_at_current_directory_without_toml();
+    let git_downloader = git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
     let result = provide_local_package(
         "hello_world".into(),
         Utf8Path::new("./test/hello_world"),
         Utf8Path::new("./"),
         &project_paths,
+        &git_downloader,
+        runtime.handle(),
         &mut provided,
         &mut vec!["root".into(), "subpackage".into()],
     );
@@ -1010,6 +1051,8 @@ fn provide_conflicting_package() {
             path: Utf8Path::new("./test/other").to_path_buf(),
         },
         &project_paths,
+        &git_downloader,
+        runtime.handle(),
         &mut provided,
         &mut vec!["root".into(), "subpackage".into()],
     );
@@ -1023,12 +1066,17 @@ fn provide_conflicting_package() {
 #[test]
 fn provided_is_absolute() {
     let mut provided = HashMap::new();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fs = ProjectIO::new();
     let project_paths = crate::project_paths_at_current_directory_without_toml();
+    let git_downloader = git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
     let result = provide_local_package(
         "hello_world".into(),
         Utf8Path::new("./test/hello_world"),
         Utf8Path::new("./"),
         &project_paths,
+        &git_downloader,
+        runtime.handle(),
         &mut provided,
         &mut vec!["root".into(), "subpackage".into()],
     );
@@ -1044,12 +1092,17 @@ fn provided_is_absolute() {
 #[test]
 fn provided_recursive() {
     let mut provided = HashMap::new();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fs = ProjectIO::new();
     let project_paths = crate::project_paths_at_current_directory_without_toml();
+    let git_downloader = git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
     let result = provide_local_package(
         "hello_world".into(),
         Utf8Path::new("./test/hello_world"),
         Utf8Path::new("./"),
         &project_paths,
+        &git_downloader,
+        runtime.handle(),
         &mut provided,
         &mut vec!["root".into(), "hello_world".into(), "subpackage".into()],
     );
