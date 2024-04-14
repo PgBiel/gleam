@@ -719,8 +719,7 @@ fn resolve_versions<Telem: Telemetry>(
     let mut root_requirements = HashMap::new();
 
     let fs = ProjectIO::new();
-    let git_downloader =
-        git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
+    let git_downloader = git::Downloader::new(Box::new(fs), Box::new(fs), project_paths.clone());
 
     // Populate the provided_packages and root_requirements maps
     for (name, requirement) in dependencies.into_iter() {
@@ -853,7 +852,18 @@ fn get_checked_out_commit_of_repository(path: &Utf8Path) -> Result<String> {
         .output();
 
     match result {
-        Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).to_string()),
+        Ok(output) => {
+            let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if output.status.success() && commit != "HEAD" {
+                Ok(commit)
+            } else {
+                // TODO: Proper error (invalid commit)
+                Err(Error::ShellCommand {
+                    program: "git".into(),
+                    err: None,
+                })
+            }
+        }
         Err(error) => match error.kind() {
             io::ErrorKind::NotFound => Err(Error::ShellProgramNotFound {
                 program: "git".into(),

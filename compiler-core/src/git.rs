@@ -79,6 +79,15 @@ impl Downloader {
     ) -> crate::Result<bool> {
         let repository_path = self.paths.build_packages_package(name);
 
+        // Ensure it is a valid option
+        if commit.is_empty() || commit.chars().next().is_some_and(|c| c == '-') {
+            // TODO: Proper error
+            return Err(Error::ShellCommand {
+                program: "git".into(),
+                err: None,
+            });
+        }
+
         let commit_exists = self
             .executor
             .exec(
@@ -87,7 +96,7 @@ impl Downloader {
                     "cat-file".into(),
                     "commit".into(),
                     "--".into(),
-                    commit.into(),
+                    commit.trim().into(),
                 ],
                 &[],
                 Some(&repository_path),
@@ -120,7 +129,8 @@ impl Downloader {
             &[
                 "checkout".into(),
                 "--detach".into(),
-                "--".into(),
+                // We have already checked whether the commit does not begin with
+                // a hyphen above. It is therefore safe to pass it directly here.
                 commit.into(),
             ],
             &[],
